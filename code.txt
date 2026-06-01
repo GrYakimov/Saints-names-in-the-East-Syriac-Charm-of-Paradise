@@ -1,0 +1,238 @@
+import os
+import re
+import numpy as np
+import pandas as pd
+
+from scipy.spatial.distance import squareform
+from scipy.cluster.hierarchy import linkage, dendrogram
+
+import plotly.graph_objects as go
+
+INPUT_CSV = "lists_according_to_all_manuscripts.csv"
+OUTPUT_DIR = "stemma_output"
+ROUND_DIGITS = 4
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+comment_re = re.compile(r"<!--.*?-->", re.S)
+tag_re = re.compile(r"<[^>]+>")
+ref_re = re.compile(r'<persName\b[^>]*\bref=["\']([^"\']+)["\']')
+
+def normalize_space(s: str) -> str:
+    return re.sub(r"\s+", " ", str(s)).strip()
+
+def extract_entry(cell):
+    if cell is None:
+        return None
+    s = str(cell).strip()
+    if not s:
+        return None
+    if "<persName" not in s:
+        return None
+    ref_match = ref_re.search(s)
+    no_comments = comment_re.sub(" ", s)
+    surface = normalize_space(tag_re.sub(" ", no_comments))
+    if not surface:
+        return None
+    if ref_match:
+        referent = normalize_space(ref_match.group(1))
+    else:
+        referent = surface
+    return {
+        "referent": referent,
+        "surface": surface
+    }
+
+try:
+    df = pd.read_csv(INPUT_CSV, dtype=str, keep_default_na=False)
+except Exception:
+    df = pd.read_csv(INPUT_CSV, dtype=str, keep_default_na=False, engine="python")
+
+manuscripts = [c for c in df.columns if str(c).strip() and not str(c).startswith("Unnamed")]
+
+parsed = {}
+
+for ms in manuscripts:
+    seq = []
+    orth = {}
+    for cell in df[ms].tolist():
+        entry = extract_entry(cell)
+        if entry is None:
+            continue
+        ref = entry["referent"]
+        surf = entry["surface"]
+        seq.append(ref)
+        orth.setdefault(ref, set()).add(surf)
+    parsed[ms] = {
+        "seq": seq,
+        "set": set(seq),
+        "orth": orth
+    }
+
+def lcs_len(a, b):
+    if not a or not b:
+        return 0
+    if len(a) < len(b):
+        a, b = b, a
+    prev = [0] * (len(b) + 1)
+    for x in a:
+        curr = [0]
+        for j, y in enumerate(b, start=1):
+            if x == y:
+                curr.append(prev[j - 1] + 1)
+            else:
+                curr.append(max(prev[j], curr[-1]))
+        prev = curr
+    return prev[-1]
+
+def presence_similarity(ms_a, ms_b):
+    A = parsed[ms_a]["set"]
+    B = parsed[ms_b]["set"]
+    union = A | B
+    if not union:
+        return 0.0
+    return len(A & B) / len(union)
+
+def order_similarity(ms_a, ms_b):
+    shared = parsed[ms_a]["set"] & parsed[ms_b]["set"]
+    if not shared:
+        return 0.0
+    qa = [x for x in parsed[ms_a]["seq"] if x in shared]
+    qb = [x for x in parsed[ms_b]["seq"] if x in shared]
+    denom = max(len(qa), len(qb))
+    if denom == 0:
+        return 0.0
+    return lcs_len(qa, qb) / denom
+
+def orthography_similarity(ms_a, ms_b):
+    shared = parsed[ms_a]["set"] & parsed[ms_b]["set"]
+    if not shared:
+        return 0.0
+    vals = []
+    for r in shared:
+        sa = parsed[ms_a]["orth"].get(r, set())
+        sb = parsed[ms_b]["orth"].get(r, set())
+        union = sa | sb
+        if not union:
+            vals.append(0.0)
+        else:
+            vals.append(len(sa & sb) / len(union))
+    return sum(vals) / len(vals)
+
+presence_mat = pd.DataFrame(index=manuscripts, columns=manuscripts, dtype=float)
+order_mat = pd.DataFrame(index=manuscripts, columns=manuscripts, dtype=float)
+orth_mat = pd.DataFrame(index=manuscripts, columns=manuscripts, dtype=float)
+total_mat = pd.DataFrame(index=manuscripts, columns=manuscripts, dtype=float)
+
+for a in manuscripts:
+    for b in manuscripts:
+        p = presence_similarity(a, b)
+        o = order_similarity(a, b)
+        h = orthography_similarity(a, b)
+        t = 0.2 * p + 0.4 * o + 0.4 * h
+
+        presence_mat.loc[a, b] = p
+        order_mat.loc[a, b] = o
+        orth_mat.loc[a, b] = h
+        total_mat.loc[a, b] = t
+
+presence_mat = presence_mat.round(ROUND_DIGITS)
+order_mat = order_mat.round(ROUND_DIGITS)
+orth_mat = orth_mat.round(ROUND_DIGITS)
+total_mat = total_mat.round(ROUND_DIGITS)
+
+total_dist = (1 - total_mat).round(ROUND_DIGITS)
+for ms in manuscripts:
+    total_dist.loc[ms, ms] = 0.0
+
+xlsx_path = os.path.join(OUTPUT_DIR, "stemma_tables.xlsx")
+with pd.ExcelWriter(xlsx_path, engine="openpyxl") as writer:
+    presence_mat.to_excel(writer, sheet_name="presence_sim")
+    order_mat.to_excel(writer, sheet_name="order_sim")
+    orth_mat.to_excel(writer, sheet_name="orthography_sim")
+    total_dist.to_excel(writer, sheet_name="total_dist")
+
+dist_array = total_dist.astype(float).to_numpy(copy=True)
+np.fill_diagonal(dist_array, 0.0)
+
+condensed = squareform(dist_array, checks=False)
+Z = linkage(condensed, method="average", optimal_ordering=True)
+
+D = dendrogram(
+    Z,
+    labels=manuscripts,
+    orientation="left",
+    no_plot=True
+)
+
+fig = go.Figure()
+
+palette = [
+    "#636EFA", "#EF553B", "#00CC96", "#AB63FA", "#FFA15A",
+    "#19D3F3", "#FF6692", "#B6E880", "#FF97FF", "#FECB52"
+]
+
+for i, (xs, ys) in enumerate(zip(D["dcoord"], D["icoord"])):
+    fig.add_trace(
+        go.Scatter(
+            x=xs,
+            y=ys,
+            mode="lines",
+            line=dict(width=1.8, color=palette[i % len(palette)]),
+            hoverinfo="skip",
+            showlegend=False
+        )
+    )
+
+leaf_positions = {lab: 5 + i * 10 for i, lab in enumerate(D["ivl"])}
+tickvals = [leaf_positions[lab] for lab in D["ivl"]]
+ticktext = D["ivl"]
+
+n_labels = len(D["ivl"])
+fig_height = max(700, 28 * n_labels)
+max_dist = float(np.max(Z[:, 2])) if len(Z) else 1.0
+
+fig.update_layout(
+    title=None,
+    showlegend=False,
+    template="plotly_white",
+    font=dict(size=14),
+    width=1200,
+    height=fig_height,
+    margin=dict(l=40, r=260, t=20, b=30),
+    plot_bgcolor="white",
+    paper_bgcolor="white"
+)
+
+fig.update_xaxes(
+    title_text="",
+    autorange="reversed",
+    ticks="outside",
+    showgrid=True,
+    gridcolor="rgba(0,0,0,0.10)",
+    zeroline=False,
+    range=[max_dist * 1.05, -max_dist * 0.15]
+)
+
+fig.update_yaxes(
+    title_text="",
+    side="right",
+    showticklabels=True,
+    tickmode="array",
+    tickvals=tickvals,
+    ticktext=ticktext,
+    ticks="",
+    automargin=True,
+    showgrid=False,
+    zeroline=False,
+    tickfont=dict(size=11)
+)
+
+png_path = os.path.join(OUTPUT_DIR, "stemma_total_similarity.png")
+svg_path = os.path.join(OUTPUT_DIR, "stemma_total_similarity.svg")
+
+fig.write_image(png_path, width=1200, height=fig_height, scale=2)
+fig.write_image(svg_path, width=1200, height=fig_height)
+
+print("Done.")
+print("Files written to:", os.path.abspath(OUTPUT_DIR))

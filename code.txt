@@ -150,6 +150,7 @@ with pd.ExcelWriter(xlsx_path, engine="openpyxl") as writer:
     presence_mat.to_excel(writer, sheet_name="presence_sim")
     order_mat.to_excel(writer, sheet_name="order_sim")
     orth_mat.to_excel(writer, sheet_name="orthography_sim")
+    total_mat.to_excel(writer, sheet_name="total_similarity")
     total_dist.to_excel(writer, sheet_name="total_dist")
 
 dist_array = total_dist.astype(float).to_numpy(copy=True)
